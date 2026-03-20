@@ -165,38 +165,77 @@ class SDKTracer:
             _stack_var.set(stack)
 
         end_time = int(time.time() * 1000)
-
         trace_id = _trace_id_var.get()
 
         final_metadata = (metadata or {}).copy()
         final_usage = (usage or {}).copy()
-
         final_metadata.update(error_metadata or {})
 
-        if result_parser and status == "success":
+        # --- SMART DECLARATIVE PARSING ---
+        if status == "success":
+            # 1. Use manual result_parser if provided (for backward compatibility)
+            if result_parser:
+                try:
+                    parsed = result_parser(output, args, kwargs)
+                    if isinstance(parsed, dict):
+                        final_metadata.update(parsed.get("metadata", {}))
+                        raw_usage = parsed.get("usage")
+                        if raw_usage:
+                            normalized = self._normalize_usage(raw_usage)
+                            final_usage.update(normalized)
+                            final_metadata["_provider_raw_usage"] = raw_usage
+                except Exception as e:
+                    final_metadata["_parser_error"] = str(e)
 
-            try:
-                parsed = result_parser(output, args, kwargs)
+            # 2. Automatic parsing based on span_type if no manual parser or to supplement
+            elif span_type:
+                try:
+                    if span_type == "intent-classification" and isinstance(output, (list, tuple)) and len(output) >= 2:
+                        final_metadata["intent"] = output[0]
+                        raw_usage = output[1]
+                        if isinstance(raw_usage, dict):
+                            normalized = self._normalize_usage(raw_usage)
+                            final_usage.update(normalized)
+                            final_metadata["_provider_raw_usage"] = raw_usage
 
-                if isinstance(parsed, dict):
+                    elif span_type == "retrieval" and isinstance(output, (list, tuple)) and len(output) >= 2:
+                        # Expecting (safe_docs, docs_with_scores)
+                        safe_docs, docs_with_scores = output[0], output[1]
+                        final_metadata["documents"] = [
+                            {"content_preview": getattr(doc, "page_content", str(doc))}
+                            for doc, _ in safe_docs
+                        ] if isinstance(safe_docs, list) else []
+                        
+                        final_metadata["scores"] = [
+                            float(score) for _, score in docs_with_scores
+                        ] if isinstance(docs_with_scores, list) else []
+                        
+                        # Peek into args/kwargs/instance for threshold if available
+                        if "distance_threshold" in kwargs:
+                            final_metadata["threshold"] = kwargs["distance_threshold"]
+                        elif args and hasattr(args[0], "distance_threshold"):
+                            final_metadata["threshold"] = args[0].distance_threshold
 
-                    final_metadata.update(parsed.get("metadata", {}))
+                    elif span_type == "llm" and isinstance(output, (list, tuple)) and len(output) >= 3:
+                        # Expecting (content, prompt, usage)
+                        raw_usage = output[2]
+                        if isinstance(raw_usage, dict):
+                            normalized = self._normalize_usage(raw_usage)
+                            final_usage.update(normalized)
+                            final_metadata["_provider_raw_usage"] = raw_usage
+                        
+                        # Auto-extract temperature if in kwargs
+                        if "temperature" in kwargs:
+                            final_metadata["temperature"] = kwargs["temperature"]
+                        
+                except Exception as e:
+                    final_metadata["_auto_parser_error"] = str(e)
 
-                    raw_usage = parsed.get("usage")
-
-                    if raw_usage:
-                        normalized = self._normalize_usage(raw_usage)
-                        final_usage.update(normalized)
-                        final_metadata["_provider_raw_usage"] = raw_usage
-
-            except Exception as e:
-                final_metadata["_parser_error"] = str(e)
-
-        if include_io and not final_metadata:
-            final_metadata = {
+        if include_io and not final_metadata and not result_parser:
+            final_metadata.update({
                 "input": self._safe_serialize(args),
                 "output": self._safe_serialize(output),
-            }
+            })
 
         span = {
             "trace_id": trace_id,
@@ -235,6 +274,13 @@ class SDKTracer:
     ):
 
         span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
+
+        # Auto-extract parameters from kwargs to metadata
+        if not metadata:
+            metadata = {}
+        for param in ["temperature", "model", "model_name", "top_p", "intent"]:
+            if param in kwargs:
+                metadata[param] = kwargs[param]
 
         def finalize(status, output, error_meta):
             self._after_span(
@@ -353,21 +399,27 @@ class SDKTracer:
     ):
 
         spans = _spans_var.get()
-
         trace_id = _trace_id_var.get() or f"trace-{uuid.uuid4().hex[:8]}"
 
         provider_raw = None
+        detected_rag_docs = rag_docs
 
         for span in spans:
-            if span["type"] == "llm":
+            # 1. Root level provider_raw comes from any LLM span
+            if span["type"] == "llm" and not provider_raw:
                 provider_raw = (
                     span["metadata"].get("_provider_raw_usage")
                     or span["usage"]
                 )
-                break
+            
+            # 2. Extract rag_docs if not manually provided
+            if span["type"] == "retrieval" and not detected_rag_docs:
+                docs = span["metadata"].get("documents", [])
+                scores = span["metadata"].get("scores", [])
+                if docs and scores:
+                    detected_rag_docs = list(zip(docs, scores))
 
         latency = None
-
         if spans:
             start = min(s["start_time"] for s in spans)
             end = max(s["end_time"] for s in spans)
@@ -388,7 +440,7 @@ class SDKTracer:
             "input": {"query": query},
             "output": {"answer": answer},
             "latency_ms": latency,
-            "rag_docs": self._safe_serialize(rag_docs, 1000) if rag_docs else None,
+            "rag_docs": self._safe_serialize(detected_rag_docs, 1000) if detected_rag_docs else None,
             "spans": spans,
             "provider_raw": provider_raw,
             "status": "success",
