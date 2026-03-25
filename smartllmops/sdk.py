@@ -38,7 +38,14 @@ class SDKTracer:
 
         if not usage:
             return {}
+        
+        # Deep inspection for nested usage blocks (Groq/Anthropic/Vertex styles)
+        for key in ["token_usage", "usage_metadata", "usage"]:
+            if key in usage and isinstance(usage[key], dict):
+                usage = usage[key]
+                break
 
+        # Standard (OpenAI/Groq style)
         if "prompt_tokens" in usage or "completion_tokens" in usage:
             prompt = int(usage.get("prompt_tokens", 0) or 0)
             completion = int(usage.get("completion_tokens", 0) or 0)
@@ -48,7 +55,7 @@ class SDKTracer:
                 "completion_tokens": completion,
                 "total_tokens": int(usage.get("total_tokens", prompt + completion))
             }
-
+        #Handles Google Vertex AI style
         if "usage_metadata" in usage:
             meta = usage["usage_metadata"]
 
@@ -60,7 +67,7 @@ class SDKTracer:
                 "completion_tokens": completion,
                 "total_tokens": int(meta.get("total_token_count", prompt + completion))
             }
-
+        #Handles Anthropic style
         if "input_tokens" in usage or "output_tokens" in usage:
             prompt = int(usage.get("input_tokens", 0))
             completion = int(usage.get("output_tokens", 0))
@@ -70,14 +77,14 @@ class SDKTracer:
                 "completion_tokens": completion,
                 "total_tokens": prompt + completion
             }
-
+        #Fallback for unknown formats
         return {}
 
     # ---------------------------------------------------------
     # SAFE SERIALIZATION
     # ---------------------------------------------------------
 
-    def _safe_serialize(self, obj, max_length=150):
+    def _safe_serialize(self, obj, max_length=300):
 
         def _serialize(o, depth=0):
 
@@ -101,9 +108,9 @@ class SDKTracer:
 
             if isinstance(o, dict):
                 items = []
-                for k, v in list(o.items())[:2]:
+                for k, v in list(o.items())[:5]:
                     items.append(f"{k}: {_serialize(v, depth + 1)}")
-                if len(o) > 2:
+                if len(o) > 5:
                     items.append("...")
                 return "{" + ", ".join(items) + "}"
 
@@ -198,6 +205,9 @@ class SDKTracer:
                             final_usage.update(normalized)
                             final_metadata["_provider_raw_usage"] = raw_usage
 
+                    elif span_type == "chain" and isinstance(output, str):
+                        final_metadata["rewritten_query"] = output
+
                     elif span_type == "retrieval" and isinstance(output, (list, tuple)) and len(output) >= 2:
                         # Expecting (safe_docs, docs_with_scores)
                         safe_docs, docs_with_scores = output[0], output[1]
@@ -224,16 +234,35 @@ class SDKTracer:
                             final_usage.update(normalized)
                             final_metadata["_provider_raw_usage"] = raw_usage
                         
-                        # Auto-extract temperature if in kwargs
+                        # Auto-extract parameters if in kwargs
                         if "temperature" in kwargs:
                             final_metadata["temperature"] = kwargs["temperature"]
+                        
+                        # Extract and count context tokens
+                        context = kwargs.get("context") or (args[2] if len(args) > 2 else None)
+                        if context and isinstance(context, str):
+                            # Try to use tiktoken if available on the instance
+                            if args and hasattr(args[0], "enc"):
+                                final_metadata["context_tokens"] = len(args[0].enc.encode(context))
+                            else:
+                                # Fallback to rough estimate (words * 1.3)
+                                final_metadata["context_tokens"] = int(len(context.split()) * 1.3)
+
+                        if args and hasattr(args[0], "llm"):
+                            # Try to peek into the class instance's LLM config
+                            llm = args[0].llm
+                            for attr in ["temperature", "model_name", "model"]:
+                                if hasattr(llm, attr):
+                                    final_metadata[attr] = getattr(llm, attr)
                         
                 except Exception as e:
                     final_metadata["_auto_parser_error"] = str(e)
 
         if include_io and not final_metadata and not result_parser:
+            # Skip 'self' in args if it's a method call
+            display_args = args[1:] if args and hasattr(args[0], "tracer") else args
             final_metadata.update({
-                "input": self._safe_serialize(args),
+                "input": self._safe_serialize(display_args),
                 "output": self._safe_serialize(output),
             })
 
