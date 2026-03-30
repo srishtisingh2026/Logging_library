@@ -1,21 +1,5 @@
-import json
-import logging
 import os
 from datetime import datetime
-
-# Setup local logging
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-log_file_path = os.path.join(LOG_DIR, "rag_app.log")
-
-logger = logging.getLogger("smartllmops_logger")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-
-if not logger.handlers:
-    file_handler = logging.FileHandler(log_file_path, mode="a")
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(file_handler)
 
 class Telemetry:
     def __init__(self, cosmos_conn=None, db_name=None, container_name=None):
@@ -50,9 +34,7 @@ class Telemetry:
             # Ensure timestamp
             trace.setdefault("logged_at", datetime.utcnow().isoformat())
 
-            # 1. Local logging
-            logger.info(json.dumps(trace))
-            # 2. Cosmos DB
+            # Cosmos DB
             if self.container:
                 try:
                     self.container.upsert_item(body=trace)
@@ -61,3 +43,4 @@ class Telemetry:
 
         except Exception as e:
             print(f"Telemetry error: {e}")
+

@@ -84,6 +84,5 @@ def run_pipeline(user_query):
 ```
 
 ## 📊 Telemetry
-Traces are automatically:
-1. Logged to `logs/rag_app.log` in JSON format.
-2. Upserted to your configured Azure Cosmos DB container for dashboarding.
+Traces are automatically upserted to your configured Azure Cosmos DB container for dashboarding.
+
