@@ -14,11 +14,11 @@ _trace_id_var: ContextVar[str] = ContextVar("trace_id", default=None)
 
 class SDKTracer:
 
-    def __init__(self, telemetry, environment="prod", model="unknown", provider="unknown"):
+    def __init__(self, telemetry, environment="prod", model=None, provider=None):
         self.telemetry = telemetry
         self.environment = environment
-        self.model = model
-        self.provider = provider
+        self.model = model or "unknown"
+        self.provider = provider or "unknown"
 
     # ---------------------------------------------------------
     # TRACE INITIALIZATION
@@ -251,6 +251,18 @@ class SDKTracer:
                         if args and hasattr(args[0], "llm"):
                             # Try to peek into the class instance's LLM config
                             llm = args[0].llm
+                            
+                            # DYNAMIC PROVIDER DETECTION
+                            class_name = llm.__class__.__name__.lower()
+                            if "groq" in class_name:
+                                final_metadata["_provider_detected"] = "groq"
+                            elif "openai" in class_name:
+                                final_metadata["_provider_detected"] = "openai"
+                            elif "anthropic" in class_name:
+                                final_metadata["_provider_detected"] = "anthropic"
+                            elif "google" in class_name or "vertex" in class_name:
+                                final_metadata["_provider_detected"] = "google"
+
                             for attr in ["temperature", "model_name", "model"]:
                                 if hasattr(llm, attr):
                                     final_metadata[attr] = getattr(llm, attr)
@@ -266,12 +278,18 @@ class SDKTracer:
                 "output": self._safe_serialize(output),
             })
 
+        # --- LAZY SPAN NAMING ---
+        final_span_name = span_name
+        if "{provider}" in final_span_name:
+            detected = final_metadata.get("_provider_detected") or self.provider
+            final_span_name = final_span_name.replace("{provider}", detected)
+
         span = {
             "trace_id": trace_id,
             "span_id": span_id,
             "parent_span_id": effective_parent,
             "type": span_type or "generic",
-            "name": span_name,
+            "name": final_span_name,
             "start_time": start_time,
             "end_time": end_time,
             "latency_ms": end_time - start_time,
@@ -430,16 +448,28 @@ class SDKTracer:
         spans = _spans_var.get()
         trace_id = _trace_id_var.get() or f"trace-{uuid.uuid4().hex[:8]}"
 
+        # NEW: Dynamic inference from spans
+        detected_provider = self.provider
+        detected_model = self.model
         provider_raw = None
         detected_rag_docs = rag_docs
 
         for span in spans:
-            # 1. Root level provider_raw comes from any LLM span
-            if span["type"] == "llm" and not provider_raw:
-                provider_raw = (
-                    span["metadata"].get("_provider_raw_usage")
-                    or span["usage"]
-                )
+            # 1. Root level metadata inference
+            if span["type"] == "llm":
+                if not provider_raw:
+                    provider_raw = (
+                        span["metadata"].get("_provider_raw_usage")
+                        or span["usage"]
+                    )
+                
+                # Capture dynamic provider/model from span metadata
+                if span["metadata"].get("_provider_detected"):
+                    detected_provider = span["metadata"]["_provider_detected"]
+                
+                real_model = span["metadata"].get("model_name") or span["metadata"].get("model")
+                if real_model:
+                    detected_model = real_model
             
             # 2. Extract rag_docs if not manually provided
             if span["type"] == "retrieval" and not detected_rag_docs:
@@ -464,8 +494,8 @@ class SDKTracer:
             "user_id": user_id,
             "timestamp": timestamp or int(time.time() * 1000),
             "environment": self.environment,
-            "provider": self.provider,
-            "model": self.model,
+            "provider": detected_provider,
+            "model": detected_model,
             "input": {"query": query},
             "output": {"answer": answer},
             "latency_ms": latency,

@@ -1,7 +1,7 @@
 from .sdk import SDKTracer
 from .transport import Telemetry
 
-def init(cosmos_conn=None, db_name=None, container_name=None, environment="prod", model="unknown", provider="unknown"):
+def init(cosmos_conn=None, db_name=None, container_name=None, environment="prod", model=None, provider=None):
     """Initializes and returns a tracer instance."""
     telemetry = Telemetry(
         cosmos_conn=cosmos_conn,
