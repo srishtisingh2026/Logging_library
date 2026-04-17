@@ -19,6 +19,14 @@ class SDKTracer:
         self.environment = environment
         self.model = model or "unknown"
         self.provider = provider or "unknown"
+        self.enrichers = {
+            "llm": self._enrich_llm,
+            "retrieval": self._enrich_retrieval,
+            "tool": self._enrich_tool,
+            "planner": self._enrich_planner,
+            "intent-classification": self._enrich_intent,
+            "chain": self._enrich_chain,
+        }
 
     # ---------------------------------------------------------
     # TRACE INITIALIZATION
@@ -46,14 +54,15 @@ class SDKTracer:
                 break
 
         # Standard (OpenAI/Groq style)
-        if "prompt_tokens" in usage or "completion_tokens" in usage:
+        if "prompt_tokens" in usage or "completion_tokens" in usage or "total_tokens" in usage:
             prompt = int(usage.get("prompt_tokens", 0) or 0)
             completion = int(usage.get("completion_tokens", 0) or 0)
+            total = int(usage.get("total_tokens", prompt + completion))
 
             return {
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "total_tokens": int(usage.get("total_tokens", prompt + completion))
+                "total_tokens": total
             }
         #Handles Google Vertex AI style
         if "usage_metadata" in usage:
@@ -79,6 +88,159 @@ class SDKTracer:
             }
         #Fallback for unknown formats
         return {}
+
+    def _generic_parse(self, output, args, kwargs, span_type, include_io=True):
+        metadata = {}
+        usage = {}
+
+        # 1. IO Previews
+        if include_io:
+            # Skip 'self' in args if it's a method call (heuristic: check for 'tracer' or 'llm' or 'enrichers')
+            skip_first = False
+            if args:
+                first_arg = args[0]
+                if hasattr(first_arg, "tracer") or hasattr(first_arg, "enrichers") or hasattr(first_arg, "llm"):
+                    skip_first = True
+            
+            display_args = args[1:] if skip_first else args
+            metadata["input"] = self._safe_serialize(display_args)
+            metadata["output"] = self._safe_serialize(output)
+
+        # 2. Extract common parameters from kwargs
+        common_params = [
+            "temperature",
+            "model",
+            "model_name",
+            "top_p",
+            "step_number",
+            "iteration",
+            "tool_name",
+        ]
+        for param in common_params:
+            if param in kwargs:
+                metadata[param] = kwargs[param]
+
+        # 3. Token Usage Heuristics
+        # Look for usage in output (if it's a dict or has a usage attribute)
+        raw_usage = None
+        if isinstance(output, dict):
+            raw_usage = output.get("usage") or output.get("token_usage") or output.get("usage_metadata")
+        elif hasattr(output, "usage"):
+            raw_usage = output.usage
+
+        if raw_usage:
+            normalized = self._normalize_usage(raw_usage)
+            if normalized:
+                usage.update(normalized)
+                metadata["_provider_raw_usage"] = raw_usage
+
+        return {"metadata": metadata, "usage": usage}
+
+    def _enrich_llm(self, output, args, kwargs):
+        metadata = {}
+        usage = {}
+
+        # 1. Token usage from output tuple (backward compatibility for some patterns)
+        if isinstance(output, (list, tuple)) and len(output) >= 3:
+            raw_usage = output[2]
+            if isinstance(raw_usage, dict):
+                normalized = self._normalize_usage(raw_usage)
+                usage.update(normalized)
+                metadata["_provider_raw_usage"] = raw_usage
+
+        # 2. Extract and count context tokens
+        context = kwargs.get("context") or (args[2] if len(args) > 2 else None)
+        if context and isinstance(context, str):
+            # Try to use tiktoken if available on the instance
+            if args and hasattr(args[0], "enc") and getattr(args[0], "enc", None):
+                metadata["context_tokens"] = len(args[0].enc.encode(context))
+            else:
+                # Fallback to rough estimate (words * 1.3)
+                metadata["context_tokens"] = int(len(context.split()) * 1.3)
+
+        # 3. Dynamic Provider & Model Detection from instance
+        if args and hasattr(args[0], "llm"):
+            llm = args[0].llm
+            class_name = llm.__class__.__name__.lower()
+            
+            if "groq" in class_name:
+                metadata["_provider_detected"] = "groq"
+            elif "openai" in class_name:
+                metadata["_provider_detected"] = "openai"
+            elif "anthropic" in class_name:
+                metadata["_provider_detected"] = "anthropic"
+            elif "google" in class_name or "vertex" in class_name:
+                metadata["_provider_detected"] = "google"
+
+            for attr in ["temperature", "model_name", "model"]:
+                if hasattr(llm, attr):
+                    metadata[attr] = getattr(llm, attr)
+
+        return {"metadata": metadata, "usage": usage}
+
+    def _enrich_retrieval(self, output, args, kwargs):
+        metadata = {}
+        
+        if isinstance(output, (list, tuple)) and len(output) >= 2:
+            # Expecting (safe_docs, docs_with_scores)
+            safe_docs, docs_with_scores = output[0], output[1]
+            
+            docs_metadata = []
+            if isinstance(safe_docs, list):
+                for item in safe_docs:
+                    # In case of (doc, score) or just doc
+                    doc = item[0] if isinstance(item, (list, tuple)) else item
+                    docs_metadata.append({"content_preview": getattr(doc, "page_content", str(doc))})
+            metadata["documents"] = docs_metadata
+            
+            metadata["scores"] = [
+                float(score) for _, score in docs_with_scores
+            ] if isinstance(docs_with_scores, list) else []
+            
+        # Peek into args/kwargs/instance for threshold if available
+        if "distance_threshold" in kwargs:
+            metadata["threshold"] = kwargs["distance_threshold"]
+        elif args and hasattr(args[0], "distance_threshold"):
+            metadata["threshold"] = args[0].distance_threshold
+
+        return {"metadata": metadata}
+
+    def _enrich_tool(self, output, args, kwargs):
+        return {
+            "metadata": {
+                "tool_name": kwargs.get("tool_name"),
+                "tool_output_preview": self._safe_serialize(output)
+            }
+        }
+
+    def _enrich_planner(self, output, args, kwargs):
+        return {
+            "metadata": {
+                "step_number": kwargs.get("step_number"),
+                "iteration": kwargs.get("iteration"),
+                "plan_output": self._safe_serialize(output)
+            }
+        }
+
+    def _enrich_intent(self, output, args, kwargs):
+        metadata = {}
+        usage = {}
+
+        if isinstance(output, (list, tuple)) and len(output) >= 2:
+            metadata["intent"] = output[0]
+
+            if isinstance(output[1], dict):
+                usage = self._normalize_usage(output[1])
+                metadata["_provider_raw_usage"] = output[1]
+
+        return {"metadata": metadata, "usage": usage}
+
+    def _enrich_chain(self, output, args, kwargs):
+        return {
+            "metadata": {
+                "rewritten_query": output
+            }
+        }
 
     # ---------------------------------------------------------
     # SAFE SERIALIZATION
@@ -194,89 +356,27 @@ class SDKTracer:
                 except Exception as e:
                     final_metadata["_parser_error"] = str(e)
 
-            # 2. Automatic parsing based on span_type if no manual parser or to supplement
-            elif span_type:
-                try:
-                    if span_type == "intent-classification" and isinstance(output, (list, tuple)) and len(output) >= 2:
-                        final_metadata["intent"] = output[0]
-                        raw_usage = output[1]
-                        if isinstance(raw_usage, dict):
-                            normalized = self._normalize_usage(raw_usage)
-                            final_usage.update(normalized)
-                            final_metadata["_provider_raw_usage"] = raw_usage
+            # 2. Generic Parser + Enricher Registry
+            else:
+                parsed = self._generic_parse(
+                    output,
+                    args,
+                    kwargs,
+                    span_type,
+                    include_io=include_io
+                )
+                
+                final_metadata.update(parsed.get("metadata", {}))
+                final_usage.update(parsed.get("usage", {}))
 
-                    elif span_type == "chain" and isinstance(output, str):
-                        final_metadata["rewritten_query"] = output
-
-                    elif span_type == "retrieval" and isinstance(output, (list, tuple)) and len(output) >= 2:
-                        # Expecting (safe_docs, docs_with_scores)
-                        safe_docs, docs_with_scores = output[0], output[1]
-                        final_metadata["documents"] = [
-                            {"content_preview": getattr(doc, "page_content", str(doc))}
-                            for doc, _ in safe_docs
-                        ] if isinstance(safe_docs, list) else []
-                        
-                        final_metadata["scores"] = [
-                            float(score) for _, score in docs_with_scores
-                        ] if isinstance(docs_with_scores, list) else []
-                        
-                        # Peek into args/kwargs/instance for threshold if available
-                        if "distance_threshold" in kwargs:
-                            final_metadata["threshold"] = kwargs["distance_threshold"]
-                        elif args and hasattr(args[0], "distance_threshold"):
-                            final_metadata["threshold"] = args[0].distance_threshold
-
-                    elif span_type == "llm" and isinstance(output, (list, tuple)) and len(output) >= 3:
-                        # Expecting (content, prompt, usage)
-                        raw_usage = output[2]
-                        if isinstance(raw_usage, dict):
-                            normalized = self._normalize_usage(raw_usage)
-                            final_usage.update(normalized)
-                            final_metadata["_provider_raw_usage"] = raw_usage
-                        
-                        # Auto-extract parameters if in kwargs
-                        if "temperature" in kwargs:
-                            final_metadata["temperature"] = kwargs["temperature"]
-                        
-                        # Extract and count context tokens
-                        context = kwargs.get("context") or (args[2] if len(args) > 2 else None)
-                        if context and isinstance(context, str):
-                            # Try to use tiktoken if available on the instance
-                            if args and hasattr(args[0], "enc"):
-                                final_metadata["context_tokens"] = len(args[0].enc.encode(context))
-                            else:
-                                # Fallback to rough estimate (words * 1.3)
-                                final_metadata["context_tokens"] = int(len(context.split()) * 1.3)
-
-                        if args and hasattr(args[0], "llm"):
-                            # Try to peek into the class instance's LLM config
-                            llm = args[0].llm
-                            
-                            # DYNAMIC PROVIDER DETECTION
-                            class_name = llm.__class__.__name__.lower()
-                            if "groq" in class_name:
-                                final_metadata["_provider_detected"] = "groq"
-                            elif "openai" in class_name:
-                                final_metadata["_provider_detected"] = "openai"
-                            elif "anthropic" in class_name:
-                                final_metadata["_provider_detected"] = "anthropic"
-                            elif "google" in class_name or "vertex" in class_name:
-                                final_metadata["_provider_detected"] = "google"
-
-                            for attr in ["temperature", "model_name", "model"]:
-                                if hasattr(llm, attr):
-                                    final_metadata[attr] = getattr(llm, attr)
-                        
-                except Exception as e:
-                    final_metadata["_auto_parser_error"] = str(e)
-
-        if include_io and not final_metadata and not result_parser:
-            # Skip 'self' in args if it's a method call
-            display_args = args[1:] if args and hasattr(args[0], "tracer") else args
-            final_metadata.update({
-                "input": self._safe_serialize(display_args),
-                "output": self._safe_serialize(output),
-            })
+                enricher = self.enrichers.get(span_type)
+                if enricher:
+                    try:
+                        enriched = enricher(output, args, kwargs)
+                        final_metadata.update(enriched.get("metadata", {}))
+                        final_usage.update(enriched.get("usage", {}))
+                    except Exception as e:
+                        final_metadata["_enricher_error"] = str(e)
 
         # --- LAZY SPAN NAMING ---
         final_span_name = span_name
@@ -288,6 +388,7 @@ class SDKTracer:
             "trace_id": trace_id,
             "span_id": span_id,
             "parent_span_id": effective_parent,
+            "sequence": len(spans) + 1,
             "type": span_type or "generic",
             "name": final_span_name,
             "start_time": start_time,
@@ -325,9 +426,6 @@ class SDKTracer:
         # Auto-extract parameters from kwargs to metadata
         if not metadata:
             metadata = {}
-        for param in ["temperature", "model", "model_name", "top_p", "intent"]:
-            if param in kwargs:
-                metadata[param] = kwargs[param]
 
         def finalize(status, output, error_meta):
             self._after_span(
@@ -486,6 +584,12 @@ class SDKTracer:
 
         answer = output.get("output") if isinstance(output, dict) else output
 
+        trace_status = (
+            "error"
+            if any(span["status"] == "error" for span in spans)
+            else "success"
+        )
+
         trace = {
             "id": trace_id,
             "trace_id": trace_id,
@@ -502,7 +606,7 @@ class SDKTracer:
             "rag_docs": self._safe_serialize(detected_rag_docs, 1000) if detected_rag_docs else None,
             "spans": spans,
             "provider_raw": provider_raw,
-            "status": "success",
+            "status": trace_status,
         }
 
         _spans_var.set([])
@@ -510,3 +614,4 @@ class SDKTracer:
         _trace_id_var.set(None)
 
         self.telemetry.log_trace(trace)
+        return trace
