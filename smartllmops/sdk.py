@@ -619,20 +619,22 @@ class SDKTracer:
         spans = _spans_var.get()
         trace_id = _trace_id_var.get() or f"trace-{uuid.uuid4().hex[:8]}"
 
-        # NEW: Dynamic inference from spans
+        # Aggregation Logic
         detected_provider = self.provider
         detected_model = self.model
-        provider_raw = None
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        provider_raw_sum = {}
         detected_rag_docs = rag_docs
+        llm_span_count = 0
 
         for span in spans:
-            # 1. Root level metadata inference
+            # 1. Aggregate LLM Metrics
             if span["type"] == "llm":
-                if not provider_raw:
-                    provider_raw = (
-                        span["metadata"].get("_provider_raw_usage")
-                        or span["usage"]
-                    )
+                llm_span_count += 1
+                span_usage = span.get("usage", {})
+                total_usage["prompt_tokens"] += span_usage.get("prompt_tokens", 0)
+                total_usage["completion_tokens"] += span_usage.get("completion_tokens", 0)
+                total_usage["total_tokens"] += span_usage.get("total_tokens", 0)
                 
                 # Capture dynamic provider/model from span metadata
                 if span["metadata"].get("_provider_detected"):
@@ -641,6 +643,15 @@ class SDKTracer:
                 real_model = span["metadata"].get("model_name") or span["metadata"].get("model")
                 if real_model:
                     detected_model = real_model
+
+                # Merge raw usage details (ONLY sum token counts, REMOVE timing/individual values)
+                raw = span["metadata"].get("_provider_raw_usage")
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        # Only sum numeric token-related fields; skip timing (_time) and IDs (_id)
+                        if isinstance(v, (int, float)) and not k.endswith("_id") and not k.endswith("_time"):
+                            provider_raw_sum[k] = provider_raw_sum.get(k, 0) + v
+                        # We no longer keep individual or timing values at the trace level
             
             # 2. Extract rag_docs if not manually provided
             if span["type"] == "retrieval" and not detected_rag_docs:
@@ -681,9 +692,10 @@ class SDKTracer:
             "input": {"query": query},
             "output": {"answer": answer},
             "latency_ms": latency,
+            "usage": total_usage,
             "rag_docs": self._safe_serialize(detected_rag_docs, 1000) if detected_rag_docs else None,
             "spans": spans,
-            "provider_raw": provider_raw,
+            "provider_raw": provider_raw_sum,
             "status": trace_status,
         }
 
