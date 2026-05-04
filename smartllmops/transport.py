@@ -101,6 +101,21 @@ class Telemetry:
         except Exception as e:
             print(f"Fallback retry failed: {e}")
 
+    def _sanitize(self, obj):
+        """Recursively ensure all objects in a dict/list are JSON serializable."""
+        if isinstance(obj, dict):
+            return {k: self._sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize(i) for i in obj]
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        elif hasattr(obj, "model_dump"):
+            return self._sanitize(obj.model_dump())
+        elif hasattr(obj, "dict"):
+            return self._sanitize(obj.dict())
+        else:
+            return str(obj)
+
     def log_trace(self, trace: dict):
         """Add trace to async queue for processing."""
         try:
@@ -113,6 +128,9 @@ class Telemetry:
 
             # Ensure timestamp
             trace.setdefault("logged_at", datetime.utcnow().isoformat())
+
+            # Sanitize the entire trace for JSON serialization
+            trace = self._sanitize(trace)
 
             # Put in queue (ASYNCHRONOUS)
             self.queue.put(trace)

@@ -58,10 +58,23 @@ class SDKTracer:
     # USAGE NORMALIZATION
     # ---------------------------------------------------------
 
-    def _normalize_usage(self, usage: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_usage(self, usage: Any) -> Dict[str, Any]:
 
         if not usage:
             return {}
+        
+        # Convert objects (like OpenAI's CompletionUsage) to dict
+        if not isinstance(usage, dict):
+            if hasattr(usage, "model_dump"):
+                usage = usage.model_dump()
+            elif hasattr(usage, "dict"):
+                usage = usage.dict()
+            else:
+                # Fallback: try to convert to dict via __dict__ or just use as is
+                try:
+                    usage = dict(usage)
+                except:
+                    pass
         
         # Deep inspection for nested usage blocks (Groq/Anthropic/Vertex styles)
         for key in ["token_usage", "usage_metadata", "usage"]:
@@ -111,11 +124,13 @@ class SDKTracer:
 
         # 1. IO Previews
         if include_io:
-            # Skip 'self' in args if it's a method call (heuristic: check for 'tracer' or 'llm' or 'enrichers')
+            # Skip 'self' in args if it's a method call
             skip_first = False
             if args:
                 first_arg = args[0]
-                if hasattr(first_arg, "tracer") or hasattr(first_arg, "enrichers") or hasattr(first_arg, "llm"):
+                # Heuristic: skip if it's a tracer instance OR an OpenAI-like resource
+                class_name = first_arg.__class__.__name__
+                if hasattr(first_arg, "tracer") or "Completions" in class_name or "OpenAI" in class_name:
                     skip_first = True
             
             display_args = args[1:] if skip_first else args
@@ -148,6 +163,18 @@ class SDKTracer:
             normalized = self._normalize_usage(raw_usage)
             if normalized:
                 usage.update(normalized)
+                # Ensure the raw version is also a dict for JSON serialization
+                if not isinstance(raw_usage, dict):
+                    if hasattr(raw_usage, "model_dump"):
+                        raw_usage = raw_usage.model_dump()
+                    elif hasattr(raw_usage, "dict"):
+                        raw_usage = raw_usage.dict()
+                    else:
+                        try:
+                            raw_usage = dict(raw_usage)
+                        except:
+                            raw_usage = str(raw_usage)
+                
                 metadata["_provider_raw_usage"] = raw_usage
 
         return {"metadata": metadata, "usage": usage}
@@ -163,6 +190,12 @@ class SDKTracer:
                 normalized = self._normalize_usage(raw_usage)
                 usage.update(normalized)
                 metadata["_provider_raw_usage"] = raw_usage
+            elif hasattr(raw_usage, "model_dump") or hasattr(raw_usage, "dict"):
+                # Handle objects from OpenAI/Pydantic
+                dict_usage = raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else raw_usage.dict()
+                normalized = self._normalize_usage(dict_usage)
+                usage.update(normalized)
+                metadata["_provider_raw_usage"] = dict_usage
 
         # 2. Extract and count context tokens
         context = kwargs.get("context") or (args[2] if len(args) > 2 else None)
@@ -174,23 +207,38 @@ class SDKTracer:
                 # Fallback to rough estimate (words * 1.3)
                 metadata["context_tokens"] = int(len(context.split()) * 1.3)
 
-        # 3. Dynamic Provider & Model Detection from instance
-        if args and hasattr(args[0], "llm"):
-            llm = args[0].llm
-            class_name = llm.__class__.__name__.lower()
+        # 3. Dynamic Provider & Model Detection
+        instance = args[0] if args else None
+        if instance:
+            # Check if it's the patched client resource or a standard LLM instance
+            class_name = instance.__class__.__name__.lower()
             
-            if "groq" in class_name:
+            # Heuristic for provider detection
+            target_str = ""
+            if hasattr(instance, "llm"):
+                target_str = instance.llm.__class__.__name__.lower()
+            else:
+                # For patched OpenAI/Groq clients
+                target_str = class_name
+                # Also check base_url if available on the client
+                if hasattr(instance, "_client") and hasattr(instance._client, "base_url"):
+                    target_str += str(instance._client.base_url).lower()
+
+            if "groq" in target_str:
                 metadata["_provider_detected"] = "groq"
-            elif "openai" in class_name:
+            elif "openai" in target_str:
                 metadata["_provider_detected"] = "openai"
-            elif "anthropic" in class_name:
+            elif "anthropic" in target_str:
                 metadata["_provider_detected"] = "anthropic"
-            elif "google" in class_name or "vertex" in class_name:
+            elif "google" in target_str or "vertex" in target_str:
                 metadata["_provider_detected"] = "google"
 
+            # Model detection
             for attr in ["temperature", "model_name", "model"]:
-                if hasattr(llm, attr):
-                    metadata[attr] = getattr(llm, attr)
+                if hasattr(instance, attr):
+                    metadata[attr] = getattr(instance, attr)
+                elif hasattr(instance, "llm") and hasattr(instance.llm, attr):
+                    metadata[attr] = getattr(instance.llm, attr)
 
         return {"metadata": metadata, "usage": usage}
 
@@ -645,3 +693,42 @@ class SDKTracer:
 
         self.telemetry.log_trace(trace)
         return trace
+
+    # ---------------------------------------------------------
+    # AUTO-INSTRUMENTATION (LangSmith-style)
+    # ---------------------------------------------------------
+
+    def patch_openai(self):
+        """
+        Globally patches the OpenAI library to automatically capture LLM spans.
+        """
+        try:
+            from openai.resources.chat import Completions
+            
+            original_create = Completions.create
+            tracer_instance = self
+
+            @functools.wraps(original_create)
+            def patched_create(instance, *args, **kwargs):
+                # Use the existing span execution logic
+                return tracer_instance._execute_span(
+                    original_create,
+                    (instance,) + args,
+                    kwargs,
+                    name="LLM: {provider}",
+                    span_type="llm",
+                    metadata=None,
+                    usage=None,
+                    include_io=True,
+                    result_parser=None,
+                    parent_span_id=None
+                )
+
+            Completions.create = patched_create
+            print("✅ smartllmops: OpenAI auto-instrumentation activated.")
+            
+        except ImportError:
+            # OpenAI not installed, skip patching
+            pass
+        except Exception as e:
+            print(f"⚠️ smartllmops: Failed to patch OpenAI: {e}")
