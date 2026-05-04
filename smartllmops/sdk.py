@@ -628,30 +628,38 @@ class SDKTracer:
         llm_span_count = 0
 
         for span in spans:
-            # 1. Aggregate LLM Metrics
-            if span["type"] == "llm":
-                llm_span_count += 1
-                span_usage = span.get("usage", {})
+            # 1. Aggregate Usage (from any span that has it)
+            span_usage = span.get("usage", {})
+            if span_usage:
                 total_usage["prompt_tokens"] += span_usage.get("prompt_tokens", 0)
                 total_usage["completion_tokens"] += span_usage.get("completion_tokens", 0)
                 total_usage["total_tokens"] += span_usage.get("total_tokens", 0)
-                
-                # Capture dynamic provider/model from span metadata
+
+            # 2. Capture dynamic provider/model from span metadata (prefer LLM spans)
+            if span["type"] == "llm" or span["metadata"].get("_provider_detected"):
                 if span["metadata"].get("_provider_detected"):
                     detected_provider = span["metadata"]["_provider_detected"]
                 
                 real_model = span["metadata"].get("model_name") or span["metadata"].get("model")
                 if real_model:
                     detected_model = real_model
+                
+                if span["type"] == "llm":
+                    llm_span_count += 1
 
-                # Merge raw usage details (ONLY sum token counts, REMOVE timing/individual values)
-                raw = span["metadata"].get("_provider_raw_usage")
-                if isinstance(raw, dict):
-                    for k, v in raw.items():
-                        # Only sum numeric token-related fields; skip timing (_time) and IDs (_id)
-                        if isinstance(v, (int, float)) and not k.endswith("_id") and not k.endswith("_time"):
-                            provider_raw_sum[k] = provider_raw_sum.get(k, 0) + v
-                        # We no longer keep individual or timing values at the trace level
+            # 3. Merge raw usage details (from any span with raw data)
+            raw = span["metadata"].get("_provider_raw_usage")
+            if isinstance(raw, dict):
+                # Flatten common nested usage blocks if they exist (Groq/OpenAI styles)
+                agg_data = raw.copy()
+                for nested_key in ["token_usage", "usage_metadata", "usage"]:
+                    if nested_key in agg_data and isinstance(agg_data[nested_key], dict):
+                        agg_data.update(agg_data[nested_key])
+                
+                for k, v in agg_data.items():
+                    # Only sum numeric token-related fields; skip timing (_time) and IDs (_id)
+                    if isinstance(v, (int, float)) and not k.endswith("_id") and not k.endswith("_time"):
+                        provider_raw_sum[k] = provider_raw_sum.get(k, 0) + v
             
             # 2. Extract rag_docs if not manually provided
             if span["type"] == "retrieval" and not detected_rag_docs:
