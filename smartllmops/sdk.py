@@ -2,6 +2,7 @@ import uuid
 import time
 import functools
 import inspect
+import os
 from typing import Dict, Any
 from contextvars import ContextVar
 
@@ -14,9 +15,23 @@ _trace_id_var: ContextVar[str] = ContextVar("trace_id", default=None)
 
 class SDKTracer:
 
-    def __init__(self, telemetry, environment="prod", model=None, provider=None):
+    def __init__(
+        self,
+        telemetry,
+        application_name=None,
+        environment="prod",
+        model=None,
+        provider=None,
+        tags=None
+    ):
         self.telemetry = telemetry
+        self.application_name = (
+            application_name
+            or os.getenv("SMART_LLMOPS_APP")
+            or "default-app"
+        )
         self.environment = environment
+        self.tags = tags or {}
         self.model = model or "unknown"
         self.provider = provider or "unknown"
         self.enrichers = {
@@ -26,6 +41,7 @@ class SDKTracer:
             "planner": self._enrich_planner,
             "intent-classification": self._enrich_intent,
             "chain": self._enrich_chain,
+            "agent": self._enrich_agent,
         }
 
     # ---------------------------------------------------------
@@ -242,6 +258,26 @@ class SDKTracer:
             }
         }
 
+    def _enrich_agent(self, output, args, kwargs):
+        metadata = {}
+        try:
+            if hasattr(output, "raw_responses"):
+                thoughts = []
+                for resp in output.raw_responses:
+                    if hasattr(resp, "choices") and resp.choices:
+                        msg = resp.choices[0].message
+                        if hasattr(msg, "content") and msg.content:
+                            thoughts.append(msg.content)
+                if thoughts:
+                    metadata["plan"] = "\n\n".join(thoughts)
+            
+            if hasattr(output, "final_output"):
+                metadata["agent_output"] = self._safe_serialize(output.final_output)
+        except Exception:
+            pass
+            
+        return {"metadata": metadata}
+
     # ---------------------------------------------------------
     # SAFE SERIALIZATION
     # ---------------------------------------------------------
@@ -399,7 +435,7 @@ class SDKTracer:
             "usage": final_usage,
         }
 
-        spans = spans + [span]
+        spans.append(span)
         _spans_var.set(spans)
 
     # ---------------------------------------------------------
@@ -420,34 +456,14 @@ class SDKTracer:
         parent_span_id,
         is_async=False,
     ):
-
-        span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
-
+        
         # Auto-extract parameters from kwargs to metadata
-        if not metadata:
-            metadata = {}
-
-        def finalize(status, output, error_meta):
-            self._after_span(
-                span_id,
-                span_name,
-                start_time,
-                parent,
-                status,
-                output,
-                metadata,
-                usage,
-                include_io,
-                result_parser,
-                args,
-                kwargs,
-                error_meta,
-                span_type,
-            )
+        meta_dict = metadata or {}
 
         if is_async:
 
             async def wrapper():
+                span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
                 status = "success"
                 output = None
                 error_meta = {}
@@ -463,12 +479,17 @@ class SDKTracer:
                     raise
 
                 finally:
-                    finalize(status, output, error_meta)
+                    self._after_span(
+                        span_id, span_name, start_time, parent, status, output,
+                        meta_dict, usage, include_io, result_parser, args, kwargs,
+                        error_meta, span_type
+                    )
 
             return wrapper()
 
         else:
 
+            span_id, span_name, start_time, parent = self._before_span(func, name, parent_span_id)
             status = "success"
             output = None
             error_meta = {}
@@ -484,7 +505,11 @@ class SDKTracer:
                 raise
 
             finally:
-                finalize(status, output, error_meta)
+                self._after_span(
+                    span_id, span_name, start_time, parent, status, output,
+                    meta_dict, usage, include_io, result_parser, args, kwargs,
+                    error_meta, span_type
+                )
 
     # ---------------------------------------------------------
     # DECORATOR
@@ -597,6 +622,11 @@ class SDKTracer:
             "session_id": session_id,
             "user_id": user_id,
             "timestamp": timestamp or int(time.time() * 1000),
+
+            # 🔥 ADD THESE
+            "application_name": self.application_name,
+            "tags": self.tags,
+
             "environment": self.environment,
             "provider": detected_provider,
             "model": detected_model,
